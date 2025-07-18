@@ -7,6 +7,9 @@
 (define-constant ERR_ALREADY_RESPONDED (err u105))
 (define-constant ERR_NOT_REGISTERED (err u106))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u107))
+(define-constant ERR_REPUTATION_TOO_LOW (err u108))
+(define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u109))
+(define-constant ERR_ALREADY_CLAIMED (err u110))
 
 (define-fungible-token censix-token u1000000000)
 
@@ -14,12 +17,17 @@
 (define-data-var registration-fee uint u1000000)
 (define-data-var participation-reward uint u500000)
 (define-data-var total-participants uint u0)
+(define-data-var next-achievement-id uint u1)
 
 (define-map participants principal {
     registered-at: uint,
     total-responses: uint,
     rewards-earned: uint,
-    active: bool
+    active: bool,
+    reputation-score: uint,
+    verified-responses: uint,
+    reputation-tier: uint,
+    achievement-count: uint
 })
 
 (define-map census-rounds uint {
@@ -31,7 +39,8 @@
     min-participants: uint,
     total-responses: uint,
     reward-pool: uint,
-    active: bool
+    active: bool,
+    min-reputation: uint
 })
 
 (define-map census-questions uint {
@@ -55,6 +64,28 @@
     finalized-at: uint
 })
 
+(define-map achievements uint {
+    title: (string-ascii 64),
+    description: (string-ascii 256),
+    requirement-type: (string-ascii 32),
+    requirement-value: uint,
+    reward-multiplier: uint,
+    active: bool
+})
+
+(define-map participant-achievements {participant: principal, achievement-id: uint} {
+    earned-at: uint,
+    claimed: bool
+})
+
+(define-map reputation-tiers uint {
+    tier-name: (string-ascii 32),
+    min-score: uint,
+    max-score: uint,
+    reward-multiplier: uint,
+    badge-color: (string-ascii 16)
+})
+
 (define-public (register-participant)
     (let ((current-block stacks-block-height)
           (fee (var-get registration-fee)))
@@ -64,7 +95,11 @@
             registered-at: current-block,
             total-responses: u0,
             rewards-earned: u0,
-            active: true
+            active: true,
+            reputation-score: u0,
+            verified-responses: u0,
+            reputation-tier: u0,
+            achievement-count: u0
         })
         (var-set total-participants (+ (var-get total-participants) u1))
         (ok true)
@@ -76,7 +111,8 @@
     (description (string-ascii 512))
     (duration-blocks uint)
     (min-participants uint)
-    (reward-pool uint))
+    (reward-pool uint)
+    (min-reputation uint))
     (let ((census-id (var-get next-census-id))
           (current-block stacks-block-height)
           (end-block (+ current-block duration-blocks)))
@@ -92,7 +128,8 @@
             min-participants: min-participants,
             total-responses: u0,
             reward-pool: reward-pool,
-            active: true
+            active: true,
+            min-reputation: min-reputation
         })
         (var-set next-census-id (+ census-id u1))
         (ok census-id)
@@ -125,6 +162,7 @@
         (asserts! (get active census) ERR_CENSUS_CLOSED)
         (asserts! (>= current-block (get start-block census)) ERR_INVALID_CENSUS)
         (asserts! (< current-block (get end-block census)) ERR_CENSUS_CLOSED)
+        (asserts! (>= (get reputation-score participant) (get min-reputation census)) ERR_REPUTATION_TOO_LOW)
         (asserts! (is-none (map-get? participant-census-responses {participant: tx-sender, census-id: census-id})) ERR_ALREADY_RESPONDED)
         
         (map-set census-responses {census-id: census-id, participant: tx-sender} {
@@ -152,6 +190,7 @@
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (map-set census-responses {census-id: census-id, participant: participant}
             (merge response {verified: true}))
+        (try! (update-reputation participant))
         (ok true)
     )
 )
@@ -199,12 +238,15 @@
         (match response
             resp (if (get verified resp)
                 (begin
-                    (unwrap-panic (ft-mint? censix-token reward participant))
-                    (match participant-data
-                        part (map-set participants participant 
-                            (merge part {rewards-earned: (+ (get rewards-earned part) reward)}))
-                        true)
-                    data)
+                    (let ((tier (get-participant-tier participant))
+                          (multiplier (get reward-multiplier (unwrap-panic (map-get? reputation-tiers tier))))
+                          (final-reward (* reward multiplier)))
+                        (unwrap-panic (ft-mint? censix-token final-reward participant))
+                        (match participant-data
+                            part (map-set participants participant 
+                                (merge part {rewards-earned: (+ (get rewards-earned part) final-reward)}))
+                            true)
+                        data))
                 data)
             data)
     )
@@ -241,6 +283,138 @@
         (map-set participants participant 
             (merge participant-data {active: false}))
         (ok true)
+    )
+)
+
+(define-public (initialize-reputation-system)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set reputation-tiers u0 {
+            tier-name: "Bronze",
+            min-score: u0,
+            max-score: u49,
+            reward-multiplier: u1,
+            badge-color: "bronze"
+        })
+        (map-set reputation-tiers u1 {
+            tier-name: "Silver",
+            min-score: u50,
+            max-score: u99,
+            reward-multiplier: u2,
+            badge-color: "silver"
+        })
+        (map-set reputation-tiers u2 {
+            tier-name: "Gold",
+            min-score: u100,
+            max-score: u199,
+            reward-multiplier: u3,
+            badge-color: "gold"
+        })
+        (map-set reputation-tiers u3 {
+            tier-name: "Platinum",
+            min-score: u200,
+            max-score: u499,
+            reward-multiplier: u4,
+            badge-color: "platinum"
+        })
+        (map-set reputation-tiers u4 {
+            tier-name: "Diamond",
+            min-score: u500,
+            max-score: u999999,
+            reward-multiplier: u5,
+            badge-color: "diamond"
+        })
+        (ok true)
+    )
+)
+
+(define-public (create-achievement 
+    (title (string-ascii 64))
+    (description (string-ascii 256))
+    (requirement-type (string-ascii 32))
+    (requirement-value uint)
+    (reward-multiplier uint))
+    (let ((achievement-id (var-get next-achievement-id)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set achievements achievement-id {
+            title: title,
+            description: description,
+            requirement-type: requirement-type,
+            requirement-value: requirement-value,
+            reward-multiplier: reward-multiplier,
+            active: true
+        })
+        (var-set next-achievement-id (+ achievement-id u1))
+        (ok achievement-id)
+    )
+)
+
+(define-public (claim-achievement (achievement-id uint))
+    (let ((achievement (unwrap! (map-get? achievements achievement-id) ERR_ACHIEVEMENT_NOT_FOUND))
+          (participant (unwrap! (map-get? participants tx-sender) ERR_NOT_REGISTERED))
+          (current-block stacks-block-height))
+        (asserts! (get active achievement) ERR_ACHIEVEMENT_NOT_FOUND)
+        (asserts! (is-none (map-get? participant-achievements {participant: tx-sender, achievement-id: achievement-id})) ERR_ALREADY_CLAIMED)
+        (asserts! (check-achievement-requirement tx-sender achievement) ERR_REPUTATION_TOO_LOW)
+        
+        (map-set participant-achievements {participant: tx-sender, achievement-id: achievement-id} {
+            earned-at: current-block,
+            claimed: true
+        })
+        
+        (map-set participants tx-sender 
+            (merge participant {achievement-count: (+ (get achievement-count participant) u1)}))
+        
+        (ok true)
+    )
+)
+
+(define-private (update-reputation (participant principal))
+    (let ((participant-data (unwrap! (map-get? participants participant) ERR_NOT_REGISTERED))
+          (new-verified-count (+ (get verified-responses participant-data) u1))
+          (new-reputation-score (+ (get reputation-score participant-data) u10))
+          (new-tier (calculate-reputation-tier new-reputation-score)))
+        (map-set participants participant 
+            (merge participant-data {
+                verified-responses: new-verified-count,
+                reputation-score: new-reputation-score,
+                reputation-tier: new-tier
+            }))
+        (ok true)
+    )
+)
+
+(define-private (calculate-reputation-tier (score uint))
+    (if (>= score u500)
+        u4
+        (if (>= score u200)
+            u3
+            (if (>= score u100)
+                u2
+                (if (>= score u50)
+                    u1
+                    u0))))
+)
+
+(define-private (check-achievement-requirement (participant principal) (achievement {title: (string-ascii 64), description: (string-ascii 256), requirement-type: (string-ascii 32), requirement-value: uint, reward-multiplier: uint, active: bool}))
+    (let ((participant-data (unwrap-panic (map-get? participants participant)))
+          (req-type (get requirement-type achievement))
+          (req-value (get requirement-value achievement)))
+        (if (is-eq req-type "responses")
+            (>= (get total-responses participant-data) req-value)
+            (if (is-eq req-type "reputation")
+                (>= (get reputation-score participant-data) req-value)
+                (if (is-eq req-type "verified")
+                    (>= (get verified-responses participant-data) req-value)
+                    false)))
+    )
+)
+
+(define-private (get-participant-tier (participant principal))
+    (let ((participant-data (map-get? participants participant)))
+        (match participant-data
+            part (get reputation-tier part)
+            u0)
     )
 )
 
@@ -295,6 +469,53 @@
 
 (define-read-only (get-current-census-id)
     (- (var-get next-census-id) u1)
+)
+
+(define-read-only (get-participant-reputation (participant principal))
+    (let ((participant-data (map-get? participants participant)))
+        (match participant-data
+            part {
+                reputation-score: (get reputation-score part),
+                reputation-tier: (get reputation-tier part),
+                verified-responses: (get verified-responses part),
+                achievement-count: (get achievement-count part)
+            }
+            {
+                reputation-score: u0,
+                reputation-tier: u0,
+                verified-responses: u0,
+                achievement-count: u0
+            })
+    )
+)
+
+(define-read-only (get-reputation-tier-info (tier-id uint))
+    (map-get? reputation-tiers tier-id)
+)
+
+(define-read-only (get-achievement-info (achievement-id uint))
+    (map-get? achievements achievement-id)
+)
+
+(define-read-only (get-participant-achievement (participant principal) (achievement-id uint))
+    (map-get? participant-achievements {participant: participant, achievement-id: achievement-id})
+)
+
+(define-read-only (check-reputation-requirement (participant principal) (min-reputation uint))
+    (let ((participant-data (map-get? participants participant)))
+        (match participant-data
+            part (>= (get reputation-score part) min-reputation)
+            false)
+    )
+)
+
+(define-read-only (get-tier-multiplier (participant principal))
+    (let ((tier (get-participant-tier participant))
+          (tier-info (map-get? reputation-tiers tier)))
+        (match tier-info
+            info (get reward-multiplier info)
+            u1)
+    )
 )
 
 (ft-mint? censix-token u1000000000 CONTRACT_OWNER)
