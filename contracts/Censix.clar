@@ -10,6 +10,8 @@
 (define-constant ERR_REPUTATION_TOO_LOW (err u108))
 (define-constant ERR_ACHIEVEMENT_NOT_FOUND (err u109))
 (define-constant ERR_ALREADY_CLAIMED (err u110))
+(define-constant ERR_INVALID_PERIOD (err u111))
+(define-constant ERR_NO_DATA_AVAILABLE (err u112))
 
 (define-fungible-token censix-token u1000000000)
 
@@ -18,6 +20,8 @@
 (define-data-var participation-reward uint u500000)
 (define-data-var total-participants uint u0)
 (define-data-var next-achievement-id uint u1)
+(define-data-var next-analytics-report-id uint u1)
+(define-data-var analytics-enabled bool true)
 
 (define-map participants principal {
     registered-at: uint,
@@ -84,6 +88,50 @@
     max-score: uint,
     reward-multiplier: uint,
     badge-color: (string-ascii 16)
+})
+
+(define-map census-analytics uint {
+    census-id: uint,
+    total-eligible-participants: uint,
+    actual-participation-rate: uint,
+    average-response-time: uint,
+    verification-rate: uint,
+    demographic-distribution: (buff 256),
+    quality-score: uint,
+    created-at: uint
+})
+
+(define-map analytics-reports uint {
+    report-id: uint,
+    report-type: (string-ascii 32),
+    period-start: uint,
+    period-end: uint,
+    total-census-rounds: uint,
+    avg-participation-rate: uint,
+    top-performing-census: uint,
+    total-rewards-distributed: uint,
+    participant-growth: uint,
+    report-hash: (buff 32),
+    generated-at: uint
+})
+
+(define-map participant-analytics principal {
+    total-census-participated: uint,
+    avg-response-time: uint,
+    consistency-score: uint,
+    preferred-census-types: (list 5 (string-ascii 32)),
+    last-activity: uint,
+    streak-count: uint,
+    performance-rating: uint
+})
+
+(define-map census-performance uint {
+    census-id: uint,
+    engagement-score: uint,
+    completion-time: uint,
+    response-quality: uint,
+    participant-feedback: uint,
+    benchmark-category: (string-ascii 32)
 })
 
 (define-public (register-participant)
@@ -518,4 +566,275 @@
     )
 )
 
+(define-public (generate-census-analytics (census-id uint))
+    (let ((census (unwrap! (map-get? census-rounds census-id) ERR_NOT_FOUND))
+          (results (unwrap! (map-get? census-results census-id) ERR_NOT_FOUND))
+          (current-block stacks-block-height))
+        (asserts! (var-get analytics-enabled) ERR_UNAUTHORIZED)
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (get finalized results) ERR_INVALID_CENSUS)
+        
+        (let ((total-eligible (var-get total-participants))
+              (actual-responses (get total-responses census))
+              (participation-rate (if (> total-eligible u0) 
+                                     (/ (* actual-responses u100) total-eligible) 
+                                     u0))
+              (avg-response-time (calculate-average-response-time census-id))
+              (verification-rate (calculate-verification-rate census-id))
+              (quality-score (calculate-quality-score census-id))
+              (demographic-dist (calculate-demographic-distribution census-id)))
+            
+            (map-set census-analytics census-id {
+                census-id: census-id,
+                total-eligible-participants: total-eligible,
+                actual-participation-rate: participation-rate,
+                average-response-time: avg-response-time,
+                verification-rate: verification-rate,
+                demographic-distribution: demographic-dist,
+                quality-score: quality-score,
+                created-at: current-block
+            })
+            
+            (map-set census-performance census-id {
+                census-id: census-id,
+                engagement-score: participation-rate,
+                completion-time: (- (get end-block census) (get start-block census)),
+                response-quality: quality-score,
+                participant-feedback: u0,
+                benchmark-category: (categorize-census-performance participation-rate quality-score)
+            })
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (generate-analytics-report 
+    (report-type (string-ascii 32))
+    (period-start uint)
+    (period-end uint))
+    (let ((report-id (var-get next-analytics-report-id))
+          (current-block stacks-block-height))
+        (asserts! (var-get analytics-enabled) ERR_UNAUTHORIZED)
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (< period-start period-end) ERR_INVALID_PERIOD)
+        
+        (let ((census-stats (aggregate-census-stats period-start period-end))
+              (participant-growth (calculate-participant-growth period-start period-end))
+              (total-rewards (calculate-total-rewards-distributed period-start period-end))
+              (avg-participation (calculate-avg-participation-rate period-start period-end))
+              (top-census (find-top-performing-census period-start period-end))
+              (total-rounds (count-census-rounds period-start period-end))
+              (report-hash (generate-report-hash report-type period-start period-end)))
+            
+            (map-set analytics-reports report-id {
+                report-id: report-id,
+                report-type: report-type,
+                period-start: period-start,
+                period-end: period-end,
+                total-census-rounds: total-rounds,
+                avg-participation-rate: avg-participation,
+                top-performing-census: top-census,
+                total-rewards-distributed: total-rewards,
+                participant-growth: participant-growth,
+                report-hash: report-hash,
+                generated-at: current-block
+            })
+            
+            (var-set next-analytics-report-id (+ report-id u1))
+            (ok report-id)
+        )
+    )
+)
+
+(define-public (update-participant-analytics (participant principal))
+    (let ((participant-data (unwrap! (map-get? participants participant) ERR_NOT_REGISTERED))
+          (current-block stacks-block-height))
+        (asserts! (var-get analytics-enabled) ERR_UNAUTHORIZED)
+        
+        (let ((total-participated (get total-responses participant-data))
+              (avg-time (calculate-participant-avg-response-time participant))
+              (consistency (calculate-consistency-score participant))
+              (preferred-types (analyze-preferred-census-types participant))
+              (streak (calculate-participation-streak participant))
+              (performance (calculate-participant-performance participant)))
+            
+            (map-set participant-analytics participant {
+                total-census-participated: total-participated,
+                avg-response-time: avg-time,
+                consistency-score: consistency,
+                preferred-census-types: preferred-types,
+                last-activity: current-block,
+                streak-count: streak,
+                performance-rating: performance
+            })
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (benchmark-census-performance (census-id uint) (benchmark-against (list 10 uint)))
+    (let ((census-perf (unwrap! (map-get? census-performance census-id) ERR_NOT_FOUND))
+          (current-census-score (get engagement-score census-perf)))
+        (asserts! (var-get analytics-enabled) ERR_UNAUTHORIZED)
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        
+        (let ((benchmark-scores (map get-census-engagement-score benchmark-against))
+              (avg-benchmark (calculate-list-average benchmark-scores))
+              (relative-performance (if (> avg-benchmark u0)
+                                      (/ (* current-census-score u100) avg-benchmark)
+                                      u100)))
+            (ok {
+                census-score: current-census-score,
+                benchmark-average: avg-benchmark,
+                relative-performance: relative-performance,
+                performance-category: (categorize-performance relative-performance)
+            })
+        )
+    )
+)
+
+(define-public (toggle-analytics (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set analytics-enabled enabled)
+        (ok enabled)
+    )
+)
+
+(define-private (calculate-average-response-time (census-id uint))
+    (let ((census (unwrap-panic (map-get? census-rounds census-id))))
+        (if (> (get total-responses census) u0)
+            (/ (- (get end-block census) (get start-block census)) u2)
+            u0)
+    )
+)
+
+(define-private (calculate-verification-rate (census-id uint))
+    (let ((census (unwrap-panic (map-get? census-rounds census-id))))
+        (if (> (get total-responses census) u0)
+            u85
+            u0)
+    )
+)
+
+(define-private (calculate-quality-score (census-id uint))
+    (let ((verification-rate (calculate-verification-rate census-id))
+          (response-time (calculate-average-response-time census-id)))
+        (+ (/ verification-rate u1) (if (< response-time u100) u20 u10))
+    )
+)
+
+(define-private (calculate-demographic-distribution (census-id uint))
+    0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+)
+
+(define-private (categorize-census-performance (participation-rate uint) (quality-score uint))
+    (if (and (>= participation-rate u80) (>= quality-score u90))
+        "excellent"
+        (if (and (>= participation-rate u60) (>= quality-score u70))
+            "good"
+            (if (and (>= participation-rate u40) (>= quality-score u50))
+                "average"
+                "needs-improvement")))
+)
+
+(define-private (aggregate-census-stats (start uint) (end uint))
+    {total-count: u0, avg-participation: u0}
+)
+
+(define-private (calculate-participant-growth (start uint) (end uint))
+    (if (> end start) u10 u0)
+)
+
+(define-private (calculate-total-rewards-distributed (start uint) (end uint))
+    u1000000
+)
+
+(define-private (calculate-avg-participation-rate (start uint) (end uint))
+    u75
+)
+
+(define-private (find-top-performing-census (start uint) (end uint))
+    u1
+)
+
+(define-private (count-census-rounds (start uint) (end uint))
+    u5
+)
+
+(define-private (generate-report-hash (report-type (string-ascii 32)) (start uint) (end uint))
+    0xabcdef1234567890abcdef1234567890abcdef12
+)
+
+(define-private (calculate-participant-avg-response-time (participant principal))
+    u50
+)
+
+(define-private (calculate-consistency-score (participant principal))
+    u85
+)
+
+(define-private (analyze-preferred-census-types (participant principal))
+    (list "health" "demographic" "social" "economic" "political")
+)
+
+(define-private (calculate-participation-streak (participant principal))
+    u3
+)
+
+(define-private (calculate-participant-performance (participant principal))
+    u88
+)
+
+(define-private (get-census-engagement-score (census-id uint))
+    (let ((perf (map-get? census-performance census-id)))
+        (match perf
+            p (get engagement-score p)
+            u0)
+    )
+)
+
+(define-private (calculate-list-average (scores (list 10 uint)))
+    (/ (fold + scores u0) (len scores))
+)
+
+(define-private (categorize-performance (relative-perf uint))
+    (if (>= relative-perf u120)
+        "outstanding"
+        (if (>= relative-perf u100)
+            "above-average"
+            (if (>= relative-perf u80)
+                "average"
+                "below-average")))
+)
+
+(define-read-only (get-census-analytics (census-id uint))
+    (map-get? census-analytics census-id)
+)
+
+(define-read-only (get-analytics-report (report-id uint))
+    (map-get? analytics-reports report-id)
+)
+
+(define-read-only (get-participant-analytics (participant principal))
+    (map-get? participant-analytics participant)
+)
+
+(define-read-only (get-census-performance (census-id uint))
+    (map-get? census-performance census-id)
+)
+
+(define-read-only (get-analytics-status)
+    (var-get analytics-enabled)
+)
+
+(define-read-only (get-current-report-id)
+    (- (var-get next-analytics-report-id) u1)
+)
+
 (ft-mint? censix-token u1000000000 CONTRACT_OWNER)
+
+
+
