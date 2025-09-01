@@ -1,0 +1,24 @@
+[project]
+name = 'Censix'
+description = ''
+authors = []
+telemetry = true
+cache_dir = '.\.cache'
+requirements = []
+[contracts.Censix]
+path = 'contracts/Censix.clar'
+clarity_version = 3
+epoch = 3.1
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[contracts.CensusDataBridge]
+path = 'contracts/CensusDataBridge.clar'
+clarity_version = 3
+epoch = 3.1
